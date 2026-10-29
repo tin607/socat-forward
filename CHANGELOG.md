@@ -3,6 +3,17 @@
 本项目的主要变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] - 2026-10-29
+
+### Changed
+
+- `up` 不再每次都执行 `apt-get update` + `apt-get upgrade`：socat 已安装时直接跳过软件包步骤，
+  缺失时只安装 socat，不影响系统其他软件包
+
+### Added
+
+- `-u/--update`：显式要求先更新软件源并升级已安装软件，再部署转发
+
 ## [1.0.0] - 2026-10-29
 
 ### Added

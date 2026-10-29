@@ -2,7 +2,7 @@
 #
 # socat-forward — 用 socat + systemd 托管 TCP/UDP 端口转发
 #
-# 用途：在 Ubuntu Server 上更新系统、安装 socat，并部署端口转发。
+# 用途：在 Ubuntu Server 上安装 socat 并部署端口转发（缺 socat 时才装，不自动升级系统）。
 #       转发规则通过命令行传入；监听侧可指定本机某个网卡 IP，支持多网卡/多 IP。
 #
 # 用法：
@@ -25,6 +25,7 @@
 #   -t, --target <IP>     目标 IP（规则中未写目标 IP 时使用）
 #   -f, --forward <规则>  转发规则，可重复；也可直接写成位置参数
 #   -n, --dry-run         只打印将要执行的操作，不做任何修改
+#   -u, --update          先 apt-get update 并升级已安装软件，再部署
 #   -F, --force           跳过“监听 IP 不存在 / 端口占用 / 目标为本机”的检查
 #   -p, --purge           down/clean 时同时删除 socat 软件包
 #   -V, --version         显示版本
@@ -39,7 +40,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 配置 ------------------------------
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 UNIT_PREFIX="socat-fwd"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 SOCAT_BIN="${SOCAT_BIN:-/usr/bin/socat}"
@@ -50,6 +51,7 @@ ACTION=install
 FORCE=0
 DRY_RUN=0
 PURGE=0
+UPDATE_SYSTEM=0
 TARGET_HOST=""
 FORWARD_SPECS=()
 
@@ -100,6 +102,8 @@ usage() {
   -t, --target <IP>     目标 IP（规则中未写目标 IP 时使用）
   -f, --forward <规则>  转发规则，可重复；也可直接写成位置参数
   -n, --dry-run         只打印将要执行的操作，不做任何修改
+  -u, --update          先 apt-get update 并升级已安装软件，再部署
+                        （默认不升级系统，仅在本机缺少 socat 时安装）
   -F, --force           跳过监听 IP 不存在 / 端口占用 / 目标为本机的检查
   -p, --purge           down/clean 时同时卸载 socat
   -V, --version         显示版本
@@ -408,23 +412,44 @@ check_target_reachability() {
 
 # ---------------------------- 系统与单元 ----------------------------
 
-install_packages() {
+# 默认只保证 socat 存在，不跑 apt-get upgrade；-u/--update 才升级系统。
+ensure_socat() {
   export DEBIAN_FRONTEND=noninteractive
-  log "更新软件源并升级已安装软件（保留现有配置）"
-  if (( DRY_RUN )); then
-    printf '    [dry-run] apt-get update\n'
-    printf '    [dry-run] apt-get -y upgrade\n'
-    printf '    [dry-run] apt-get install -y --no-install-recommends socat\n'
+  local apt_ran=0
+
+  if (( UPDATE_SYSTEM )); then
+    log "更新软件源并升级已安装软件（保留现有配置）"
+    if (( DRY_RUN )); then
+      printf '    [dry-run] apt-get update\n'
+      printf '    [dry-run] apt-get -y upgrade\n'
+      printf '    [dry-run] apt-get install -y --no-install-recommends socat\n'
+    else
+      apt-get update -y "${APT_OPTS[@]}"
+      apt-get -y "${APT_OPTS[@]}" \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold upgrade
+      apt-get install -y "${APT_OPTS[@]}" --no-install-recommends socat
+      apt_ran=1
+    fi
+  elif [[ -x $SOCAT_BIN ]]; then
+    log "已安装 ${SOCAT_BIN}，跳过软件包更新（需要升级系统请加 -u/--update）"
+    return 0
   else
-    apt-get update -y "${APT_OPTS[@]}"
-    apt-get -y "${APT_OPTS[@]}" \
-      -o Dpkg::Options::=--force-confdef \
-      -o Dpkg::Options::=--force-confold upgrade
-    apt-get install -y "${APT_OPTS[@]}" --no-install-recommends socat
-    [[ -x $SOCAT_BIN ]] || die "socat 安装失败（找不到 $SOCAT_BIN）"
+    log "未找到 ${SOCAT_BIN}，安装 socat"
+    if (( DRY_RUN )); then
+      printf '    [dry-run] apt-get update\n'
+      printf '    [dry-run] apt-get install -y --no-install-recommends socat\n'
+    else
+      apt-get update -y "${APT_OPTS[@]}"
+      apt-get install -y "${APT_OPTS[@]}" --no-install-recommends socat
+      apt_ran=1
+    fi
   fi
 
-  if [[ -f /var/run/reboot-required ]]; then
+  if (( apt_ran )) && [[ ! -x $SOCAT_BIN ]]; then
+    die "socat 安装失败（找不到 $SOCAT_BIN）"
+  fi
+  if (( apt_ran )) && [[ -f /var/run/reboot-required ]]; then
     warn "系统有更新需要重启后才完全生效，建议之后执行 sudo reboot"
   fi
 }
@@ -630,7 +655,7 @@ do_install() {
   check_listen_ips_exist
   check_target_loop
   check_ports_free
-  install_packages
+  ensure_socat
   open_firewall_ports
   check_target_reachability
   deploy_units
@@ -743,6 +768,7 @@ parse_args() {
         ;;
       --forward=*) FORWARD_SPECS+=("${arg#*=}") ;;
       -n|--dry-run) DRY_RUN=1 ;;
+      -u|--update)  UPDATE_SYSTEM=1 ;;
       -F|--force)   FORCE=1 ;;
       -p|--purge)   PURGE=1 ;;
       -V|--version) printf '%s %s\n' "socat-forward" "$VERSION"; exit 0 ;;
