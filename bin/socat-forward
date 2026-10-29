@@ -1,0 +1,774 @@
+#!/usr/bin/env bash
+#
+# socat-forward — 用 socat + systemd 托管 TCP/UDP 端口转发
+#
+# 用途：在 Ubuntu Server 上更新系统、安装 socat，并部署端口转发。
+#       转发规则通过命令行传入；监听侧可指定本机某个网卡 IP，支持多网卡/多 IP。
+#
+# 用法：
+#   socat-forward up -t <目标IP> <规则>... [选项]   # 部署 / 更新转发
+#   socat-forward status                            # 查看已部署的转发
+#   socat-forward down [--purge]                    # 删除已部署的转发
+#   socat-forward clean [--purge]                   # 清除所有转发（含遗留单元）
+#
+# 命令别名：
+#   up     = apply, install
+#   status = list, ls
+#   down   = remove, uninstall
+#   clean  = reset
+#
+# 规则示例：
+#   -t 8.218.254.209 tcp:2222=22 tcp:443=443 udp:443=443
+#   -t 8.218.254.209 tcp:192.168.1.4:8080=10.0.0.8:80
+#
+# 选项：
+#   -t, --target <IP>     目标 IP（规则中未写目标 IP 时使用）
+#   -f, --forward <规则>  转发规则，可重复；也可直接写成位置参数
+#   -n, --dry-run         只打印将要执行的操作，不做任何修改
+#   -F, --force           跳过“监听 IP 不存在 / 端口占用 / 目标为本机”的检查
+#   -p, --purge           down/clean 时同时删除 socat 软件包
+#   -V, --version         显示版本
+#   -h, --help            显示帮助
+#
+# 可覆盖的环境变量：
+#   UDP_IDLE_TIMEOUT  UDP 会话空闲回收秒数，默认 300
+#   UNIT_DIR          systemd 单元目录，默认 /etc/systemd/system
+#   RULES_FILE        已部署规则的状态文件，默认 /etc/socat-forward/rules.conf
+
+set -Eeuo pipefail
+
+# ------------------------------ 配置 ------------------------------
+
+VERSION="1.0.0"
+UNIT_PREFIX="socat-fwd"
+UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+SOCAT_BIN="${SOCAT_BIN:-/usr/bin/socat}"
+RULES_FILE="${RULES_FILE:-/etc/socat-forward/rules.conf}"
+UDP_IDLE_TIMEOUT="${UDP_IDLE_TIMEOUT:-300}"
+
+ACTION=install
+FORCE=0
+DRY_RUN=0
+PURGE=0
+TARGET_HOST=""
+FORWARD_SPECS=()
+
+# 解析后的规则（平行数组）
+RULE_PROTO=()
+RULE_LIP=()
+RULE_LPORT=()
+RULE_TIP=()
+RULE_TPORT=()
+
+APT_OPTS=(-o DPkg::Lock::Timeout=120)
+
+# ------------------------------------------------------------------
+
+# 输出被 head 等提前关闭时不刷错误信息（SIGPIPE=141），其余错误正常报错
+rc=0
+trap 'rc=$?; if (( rc == 141 )); then exit 141; fi; die "执行失败（第 ${LINENO} 行）：${BASH_COMMAND}（退出码 ${rc}）"' ERR
+
+log()  { printf '[*] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+die()  { printf '[x] %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+用法:
+  socat-forward up -t <目标IP> <规则>... [选项]   部署 / 更新转发
+  socat-forward status                            查看已部署的转发
+  socat-forward down [--purge]                    删除已部署的转发
+  socat-forward clean [--purge]                   清除所有转发（含遗留单元）
+
+命令别名:
+  up = apply, install   status = list, ls
+  down = remove, uninstall   clean = reset
+
+规则格式:
+  协议:[监听IP:]监听端口=[目标IP:]目标端口
+  协议为 tcp/udp；省略监听 IP 表示 0.0.0.0（所有网卡）；
+  省略目标 IP 时使用 -t/--target 的值。
+
+示例:
+  socat-forward up -t 8.218.254.209 \
+    tcp:2222=22 tcp:443=443 udp:443=443 tcp:50530=50530 tcp:50960=50960
+
+  # 多网卡：只在 192.168.1.4 上监听 8080，转发到另一台机器
+  socat-forward up -t 8.218.254.209 tcp:192.168.1.4:8080=10.0.0.8:80
+
+选项:
+  -t, --target <IP>     目标 IP（规则中未写目标 IP 时使用）
+  -f, --forward <规则>  转发规则，可重复；也可直接写成位置参数
+  -n, --dry-run         只打印将要执行的操作，不做任何修改
+  -F, --force           跳过监听 IP 不存在 / 端口占用 / 目标为本机的检查
+  -p, --purge           down/clean 时同时卸载 socat
+  -V, --version         显示版本
+  -h, --help            显示本帮助
+EOF
+}
+
+run() {
+  if (( DRY_RUN )); then
+    printf '    [dry-run] %s\n' "$*"
+  else
+    "$@"
+  fi
+}
+
+require_root() {
+  [[ ${EUID} -eq 0 ]] || die "请用 root 运行（sudo $0 ...）"
+}
+
+require_systemd() {
+  [[ -d /run/systemd/system ]] || die "没有检测到 systemd，本脚本依赖 systemd 托管转发进程"
+}
+
+# ---------------------------- 规则解析 ----------------------------
+
+is_ipv4() {
+  local ip=$1 octet IFS=.
+  [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  for octet in $ip; do
+    (( 10#$octet <= 255 )) || return 1
+  done
+  return 0
+}
+
+is_port() {
+  [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+parse_forward_spec() { # spec
+  local spec=$1 left right proto lip lport tip tport
+  if [[ $spec == *"="* ]]; then
+    left=${spec%%=*}
+    right=${spec#*=}
+  elif [[ $spec == *"->"* ]]; then
+    # 兼容显式加引号写成的 tcp:2222->22
+    left=${spec%%->*}
+    right=${spec#*->}
+  else
+    local hint=""
+    if [[ $spec == *- ]]; then
+      hint="（箭头里的 > 会被 shell 当成重定向，请改用 =）"
+    fi
+    die "转发规则格式错误：$spec${hint}；应为 协议:[监听IP:]端口=[目标IP:]端口"
+  fi
+
+  proto=${left%%:*}
+  left=${left#*:}
+  if [[ $left == *:* ]]; then
+    lip=${left%:*}
+    lport=${left##*:}
+  else
+    lip="0.0.0.0"
+    lport=$left
+  fi
+
+  if [[ $right == *:* ]]; then
+    tip=${right%:*}
+    tport=${right##*:}
+  else
+    tip=$TARGET_HOST
+    tport=$right
+  fi
+
+  [[ $proto == tcp || $proto == udp ]] || die "规则 $spec：协议只能是 tcp 或 udp"
+  is_ipv4 "$lip" || die "规则 $spec：监听地址 '$lip' 不是合法 IPv4"
+  is_port "$lport" || die "规则 $spec：监听端口 '$lport' 不合法"
+  [[ -n $tip ]] || die "规则 $spec：未指定目标 IP，请加 --target 或在规则中写明目标 IP"
+  is_ipv4 "$tip" || die "规则 $spec：目标地址 '$tip' 不是合法 IPv4"
+  is_port "$tport" || die "规则 $spec：目标端口 '$tport' 不合法"
+
+  RULE_PROTO+=("$proto")
+  RULE_LIP+=("$lip")
+  RULE_LPORT+=("$lport")
+  RULE_TIP+=("$tip")
+  RULE_TPORT+=("$tport")
+}
+
+parse_rules() {
+  (( ${#FORWARD_SPECS[@]} > 0 )) || die "至少需要一个 --forward 规则（-h 查看格式）"
+  local spec
+  for spec in "${FORWARD_SPECS[@]}"; do
+    parse_forward_spec "$spec"
+  done
+}
+
+check_rule_duplicates() {
+  local i key
+  local -A seen=()
+  for i in "${!RULE_PROTO[@]}"; do
+    key="${RULE_PROTO[$i]}|${RULE_LIP[$i]}|${RULE_LPORT[$i]}"
+    if [[ -n ${seen[$key]:-} ]]; then
+      die "重复的监听端点：${RULE_PROTO[$i]} ${RULE_LIP[$i]}:${RULE_LPORT[$i]}"
+    fi
+    seen[$key]=1
+  done
+}
+
+# ---------------------------- 状态文件 ----------------------------
+
+write_state_file() {
+  local i content=""
+  for i in "${!RULE_PROTO[@]}"; do
+    content+="${RULE_PROTO[$i]}|${RULE_LIP[$i]}|${RULE_LPORT[$i]}|${RULE_TIP[$i]}|${RULE_TPORT[$i]}"$'\n'
+  done
+  if (( DRY_RUN )); then
+    printf '    [dry-run] 写入 %s\n%s' "$RULES_FILE" "$content"
+    return 0
+  fi
+  mkdir -p "$(dirname "$RULES_FILE")"
+  printf '%s' "$content" >"$RULES_FILE"
+  chmod 0644 "$RULES_FILE"
+}
+
+remove_state_file() {
+  if (( DRY_RUN )); then
+    printf '    [dry-run] rm -f %s\n' "$RULES_FILE"
+    return 0
+  fi
+  rm -f "$RULES_FILE"
+  rmdir "$(dirname "$RULES_FILE")" 2>/dev/null || true
+}
+
+load_rules_from_file() {
+  [[ -r $RULES_FILE ]] || return 1
+  RULE_PROTO=()
+  RULE_LIP=()
+  RULE_LPORT=()
+  RULE_TIP=()
+  RULE_TPORT=()
+  local proto lip lport tip tport
+  while IFS='|' read -r proto lip lport tip tport; do
+    if [[ -z $proto || $proto == '#'* ]]; then
+      continue
+    fi
+    if [[ -z $lip || -z $lport || -z $tip || -z $tport ]]; then
+      warn "忽略格式异常的规则行：${proto}|${lip}|${lport}|${tip}|${tport}"
+      continue
+    fi
+    RULE_PROTO+=("$proto")
+    RULE_LIP+=("$lip")
+    RULE_LPORT+=("$lport")
+    RULE_TIP+=("$tip")
+    RULE_TPORT+=("$tport")
+  done <"$RULES_FILE"
+  (( ${#RULE_PROTO[@]} > 0 ))
+}
+
+# ---------------------------- 端口探测 ----------------------------
+
+# 输出本机 IPv4 监听项：每行 "本地地址<TAB>进程名,pid=N"；无进程信息时第二列为空
+port_listeners() { # proto port
+  local proto=$1 port=$2 out line addr holders holder found
+  if [[ $proto == udp ]]; then
+    out=$(ss -4 -H -lnup "sport = :${port}" 2>/dev/null || true)
+  else
+    out=$(ss -4 -H -lntp "sport = :${port}" 2>/dev/null || true)
+  fi
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    addr=$(awk '{print $4}' <<<"$line")
+    addr=${addr%":$port"}
+    [[ $addr == "*" ]] && addr="0.0.0.0"
+    holders=$(grep -o '"[^"]*",pid=[0-9]*' <<<"$line" | sed 's/"//g' || true)
+    found=0
+    if [[ -n $holders ]]; then
+      while IFS= read -r holder; do
+        [[ -n $holder ]] || continue
+        found=1
+        printf '%s\t%s\n' "$addr" "$holder"
+      done <<<"$holders"
+    fi
+    if (( ! found )); then
+      printf '%s\t\n' "$addr"
+    fi
+  done <<<"$out"
+}
+
+# 指定监听地址上是否已有监听（比指定 IP 更宽的 0.0.0.0 也算冲突/占用）
+listener_exists() { # proto lip port
+  local addr holder
+  while IFS=$'\t' read -r addr holder; do
+    [[ -n $addr ]] || continue
+    if [[ $2 == 0.0.0.0 ]]; then
+      return 0
+    fi
+    [[ $addr == "$2" ]] && return 0
+  done < <(port_listeners "$1" "$3")
+  return 1
+}
+
+# ---------------------------- 预检 ----------------------------
+
+local_ipv4s() {
+  ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+}
+
+check_listen_ips_exist() {
+  local i lip known conflict=0
+  known=$(local_ipv4s)
+  for i in "${!RULE_PROTO[@]}"; do
+    lip=${RULE_LIP[$i]}
+    [[ $lip == 0.0.0.0 ]] && continue
+    if ! grep -qxF "$lip" <<<"$known"; then
+      warn "监听地址 ${lip} 不在本机网卡上"
+      conflict=1
+    fi
+  done
+  if (( conflict )); then
+    (( FORCE )) || die "指定的监听 IP 不存在于本机；确认忽略请加 --force"
+  fi
+}
+
+get_public_ipv4() {
+  command -v curl >/dev/null 2>&1 || return 1
+  local url pub
+  for url in https://api.ipify.org https://4.ipw.cn https://ifconfig.me/ip; do
+    pub=$(curl -4fsS --max-time 5 "$url" 2>/dev/null || true)
+    if [[ $pub =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      printf '%s' "$pub"
+      return 0
+    fi
+  done
+  return 1
+}
+
+check_target_loop() {
+  local i tip known pub
+  known=$(local_ipv4s)
+  for i in "${!RULE_TIP[@]}"; do
+    tip=${RULE_TIP[$i]}
+    if grep -qxF "$tip" <<<"$known"; then
+      warn "目标 ${tip} 是本机网卡地址，转发会形成环路"
+      (( FORCE )) || die "检测到转发环路；确认不是本机请加 --force"
+    fi
+  done
+
+  pub=$(get_public_ipv4 || true)
+  if [[ -n $pub ]]; then
+    for i in "${!RULE_TIP[@]}"; do
+      if [[ ${RULE_TIP[$i]} == "$pub" ]]; then
+        warn "目标 ${pub} 是本机公网 IP，转发会形成环路"
+        (( FORCE )) || die "检测到转发环路；确认不是本机请加 --force"
+      fi
+    done
+  fi
+  return 0
+}
+
+check_ports_free() {
+  local i proto lip lport addr holder conflict=0
+  for i in "${!RULE_PROTO[@]}"; do
+    proto=${RULE_PROTO[$i]}
+    lip=${RULE_LIP[$i]}
+    lport=${RULE_LPORT[$i]}
+    while IFS=$'\t' read -r addr holder; do
+      [[ -n $addr ]] || continue
+      # 监听在其他网卡 IP 上的同端口服务不冲突
+      if [[ $lip != 0.0.0.0 && $addr != 0.0.0.0 && $addr != "$lip" ]]; then
+        continue
+      fi
+      # 重跑脚本时监听方也是 socat，视为正常
+      [[ $holder == socat,* ]] && continue
+      if [[ -z $holder ]]; then
+        warn "${proto} ${lip}:${lport} 已被占用（实际监听 ${addr}，无法获取进程名）"
+      else
+        warn "${proto} ${lip}:${lport} 已被占用（实际监听 ${addr}，进程 ${holder}）"
+      fi
+      conflict=1
+    done < <(port_listeners "$proto" "$lport")
+  done
+  if (( conflict )); then
+    (( FORCE )) || die "端口被占用，转发无法启动；确认忽略请加 --force"
+    warn "已指定 --force，继续执行（被占用的转发大概率启动失败）"
+  fi
+  return 0
+}
+
+# 从本机直连目标端口，用于提前发现对端不可达（仅提示，不阻断）
+check_target_reachability() {
+  local i key
+  local -A seen=()
+  for i in "${!RULE_PROTO[@]}"; do
+    [[ ${RULE_PROTO[$i]} == tcp ]] || continue
+    key="${RULE_TIP[$i]}:${RULE_TPORT[$i]}"
+    if [[ -n ${seen[$key]:-} ]]; then
+      continue
+    fi
+    seen[$key]=1
+    if timeout 3 bash -c "</dev/tcp/${RULE_TIP[$i]}/${RULE_TPORT[$i]}" 2>/dev/null; then
+      log "目标 ${key}/tcp 可达"
+    else
+      warn "从本机连不上 ${key}/tcp，请检查对端服务/防火墙"
+    fi
+  done
+}
+
+# ---------------------------- 系统与单元 ----------------------------
+
+install_packages() {
+  export DEBIAN_FRONTEND=noninteractive
+  log "更新软件源并升级已安装软件（保留现有配置）"
+  if (( DRY_RUN )); then
+    printf '    [dry-run] apt-get update\n'
+    printf '    [dry-run] apt-get -y upgrade\n'
+    printf '    [dry-run] apt-get install -y --no-install-recommends socat\n'
+  else
+    apt-get update -y "${APT_OPTS[@]}"
+    apt-get -y "${APT_OPTS[@]}" \
+      -o Dpkg::Options::=--force-confdef \
+      -o Dpkg::Options::=--force-confold upgrade
+    apt-get install -y "${APT_OPTS[@]}" --no-install-recommends socat
+    [[ -x $SOCAT_BIN ]] || die "socat 安装失败（找不到 $SOCAT_BIN）"
+  fi
+
+  if [[ -f /var/run/reboot-required ]]; then
+    warn "系统有更新需要重启后才完全生效，建议之后执行 sudo reboot"
+  fi
+}
+
+# ufw 已启用时放行监听端口；未启用（本机默认情况）则什么都不做
+open_firewall_ports() {
+  command -v ufw >/dev/null 2>&1 || return 0
+  local ufw_state
+  ufw_state=$(ufw status 2>/dev/null || true)
+  if [[ $ufw_state != *"Status: active"* ]]; then
+    return 0
+  fi
+  log "检测到 ufw 已启用，放行转发端口"
+  local i key
+  local -A allowed=()
+  for i in "${!RULE_PROTO[@]}"; do
+    key="${RULE_LPORT[$i]}/${RULE_PROTO[$i]}"
+    if [[ -n ${allowed[$key]:-} ]]; then
+      continue
+    fi
+    allowed[$key]=1
+    run ufw allow "$key" comment 'socat forward' || true
+  done
+}
+
+# 通配监听沿用旧命名 socat-fwd-<端口>-<协议>.service；
+# 指定网卡 IP 时追加 IP：socat-fwd-<端口>-<协议>-<ip 中的 . 换成 ->.service
+unit_name() { # proto lip lport
+  local proto=$1 lip=$2 lport=$3
+  if [[ $lip == 0.0.0.0 ]]; then
+    printf '%s-%s-%s.service' "$UNIT_PREFIX" "$lport" "$proto"
+  else
+    printf '%s-%s-%s-%s.service' "$UNIT_PREFIX" "$lport" "$proto" "${lip//./-}"
+  fi
+}
+
+unit_exec_args() { # proto lip lport tip tport
+  local proto=$1 lip=$2 lport=$3 tip=$4 tport=$5
+  if [[ $proto == udp ]]; then
+    printf -- '-T %s UDP4-LISTEN:%s,bind=%s,fork,reuseaddr UDP4:%s:%s' \
+      "$UDP_IDLE_TIMEOUT" "$lport" "$lip" "$tip" "$tport"
+  else
+    printf -- 'TCP4-LISTEN:%s,bind=%s,fork,reuseaddr,backlog=128,keepalive TCP4:%s:%s,keepalive' \
+      "$lport" "$lip" "$tip" "$tport"
+  fi
+}
+
+write_unit() { # proto lip lport tip tport
+  local proto=$1 lip=$2 lport=$3 tip=$4 tport=$5
+  local unit content
+  unit="${UNIT_DIR}/$(unit_name "$proto" "$lip" "$lport")"
+  content=$(cat <<EOF
+# Generated by setup-socat-forward.sh — 重跑脚本会覆盖本文件，请勿手工修改。
+[Unit]
+Description=socat ${proto^^} forward ${lip}:${lport} -> ${tip}:${tport}
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ExecStart=${SOCAT_BIN} -d -d $(unit_exec_args "$proto" "$lip" "$lport" "$tip" "$tport")
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)
+  if (( DRY_RUN )); then
+    printf '    [dry-run] 写入 %s\n%s\n' "$unit" "$content"
+  else
+    printf '%s\n' "$content" >"$unit"
+    chmod 0644 "$unit"
+  fi
+}
+
+deploy_units() {
+  log "生成 systemd 转发单元"
+  if (( ! DRY_RUN )); then
+    mkdir -p "$UNIT_DIR"
+  fi
+  local i
+  for i in "${!RULE_PROTO[@]}"; do
+    write_unit "${RULE_PROTO[$i]}" "${RULE_LIP[$i]}" "${RULE_LPORT[$i]}" \
+      "${RULE_TIP[$i]}" "${RULE_TPORT[$i]}"
+  done
+  run systemctl daemon-reload
+}
+
+remove_unit_wants_links() { # unit
+  local f
+  shopt -s nullglob
+  for f in "$UNIT_DIR"/*.wants/"$1"; do
+    run rm -f "$f"
+  done
+  shopt -u nullglob
+}
+
+remove_managed_unit() { # unit
+  log "  - $1"
+  run systemctl disable --now "$1" 2>/dev/null || true
+  run rm -f "$UNIT_DIR/$1"
+  remove_unit_wants_links "$1"
+}
+
+managed_units_on_disk() {
+  local f
+  shopt -s nullglob
+  for f in "$UNIT_DIR/${UNIT_PREFIX}-"*.service; do
+    basename "$f"
+  done
+  shopt -u nullglob
+}
+
+# 删除不再属于当前规则集的旧单元（例如改过规则后重跑），保证 install 是声明式的
+reconcile_stale_units() {
+  local -A desired=()
+  local i unit
+  for i in "${!RULE_PROTO[@]}"; do
+    desired["$(unit_name "${RULE_PROTO[$i]}" "${RULE_LIP[$i]}" "${RULE_LPORT[$i]}")"]=1
+  done
+  while IFS= read -r unit; do
+    [[ -n $unit ]] || continue
+    if [[ -n ${desired[$unit]:-} ]]; then
+      continue
+    fi
+    log "移除不再需要的单元 ${unit}"
+    remove_managed_unit "$unit"
+  done < <(managed_units_on_disk)
+}
+
+enable_and_start() {
+  log "设置开机自启并启动转发服务"
+  local i unit
+  for i in "${!RULE_PROTO[@]}"; do
+    unit=$(unit_name "${RULE_PROTO[$i]}" "${RULE_LIP[$i]}" "${RULE_LPORT[$i]}")
+    run systemctl enable "$unit"
+    run systemctl restart "$unit"
+  done
+}
+
+verify() {
+  if (( DRY_RUN )); then
+    log "dry-run 结束，未做任何修改"
+    return 0
+  fi
+  sleep 1
+  local i proto lip lport tip tport unit failures=0
+  for i in "${!RULE_PROTO[@]}"; do
+    proto=${RULE_PROTO[$i]}
+    lip=${RULE_LIP[$i]}
+    lport=${RULE_LPORT[$i]}
+    tip=${RULE_TIP[$i]}
+    tport=${RULE_TPORT[$i]}
+    unit=$(unit_name "$proto" "$lip" "$lport")
+    if ! systemctl is-active --quiet "$unit"; then
+      warn "${unit} 未处于运行状态，最近日志："
+      journalctl -u "$unit" -n 10 --no-pager >&2 || true
+      failures=$((failures + 1))
+      continue
+    fi
+    if listener_exists "$proto" "$lip" "$lport"; then
+      log "${unit} 运行正常（${proto} ${lip}:${lport} -> ${tip}:${tport}）"
+    else
+      warn "${unit} 正在运行，但 ${proto} ${lip}:${lport} 未监听"
+      failures=$((failures + 1))
+    fi
+  done
+  (( failures == 0 )) || return 1
+}
+
+print_summary() {
+  local i
+  log "转发规则："
+  for i in "${!RULE_PROTO[@]}"; do
+    printf '      %-4s %-16s -> %s:%s\n' \
+      "${RULE_PROTO[$i]}" "${RULE_LIP[$i]}:${RULE_LPORT[$i]}" \
+      "${RULE_TIP[$i]}" "${RULE_TPORT[$i]}"
+  done
+  log "查看日志：journalctl -u 'socat-fwd-*' -f"
+  log "云安全组入方向需放行上表中的监听端口（tcp/udp）"
+}
+
+# ---------------------------- 命令 ----------------------------
+
+do_install() {
+  require_root
+  require_systemd
+  parse_rules
+  check_rule_duplicates
+  check_listen_ips_exist
+  check_target_loop
+  check_ports_free
+  install_packages
+  open_firewall_ports
+  check_target_reachability
+  deploy_units
+  reconcile_stale_units
+  enable_and_start
+  write_state_file
+  if ! verify; then
+    die "部分转发未正常运行，请查看上方日志"
+  fi
+  print_summary
+}
+
+do_uninstall() {
+  require_root
+  require_systemd
+  if load_rules_from_file; then
+    log "停止并删除已部署的转发服务"
+    local i
+    for i in "${!RULE_PROTO[@]}"; do
+      remove_managed_unit "$(unit_name "${RULE_PROTO[$i]}" "${RULE_LIP[$i]}" "${RULE_LPORT[$i]}")"
+    done
+  else
+    warn "未找到 ${RULES_FILE}，改为删除磁盘上所有 socat-fwd 单元"
+    local unit
+    while IFS= read -r unit; do
+      [[ -n $unit ]] || continue
+      remove_managed_unit "$unit"
+    done < <(managed_units_on_disk)
+  fi
+  run systemctl daemon-reload
+  run systemctl reset-failed || true
+  remove_state_file
+  if (( PURGE )); then
+    run apt-get remove -y socat || true
+  fi
+  log "卸载完成"
+}
+
+do_clean() {
+  require_root
+  require_systemd
+  log "清除所有 socat 转发服务（含遗留单元）"
+  local unit
+  while IFS= read -r unit; do
+    [[ -n $unit ]] || continue
+    remove_managed_unit "$unit"
+  done < <(managed_units_on_disk)
+  run systemctl daemon-reload
+  run systemctl reset-failed || true
+  remove_state_file
+  if (( PURGE )); then
+    run apt-get remove -y socat || true
+  fi
+  log "清除完成"
+}
+
+do_status() {
+  require_systemd
+  local i proto lip lport tip tport unit state
+  if load_rules_from_file; then
+    printf '%-16s %-5s %-24s %-9s %s\n' "监听" "协议" "目标" "服务" "监听中"
+    for i in "${!RULE_PROTO[@]}"; do
+      proto=${RULE_PROTO[$i]}
+      lip=${RULE_LIP[$i]}
+      lport=${RULE_LPORT[$i]}
+      tip=${RULE_TIP[$i]}
+      tport=${RULE_TPORT[$i]}
+      unit=$(unit_name "$proto" "$lip" "$lport")
+      state=$(systemctl is-active "$unit" 2>/dev/null || true)
+      if listener_exists "$proto" "$lip" "$lport"; then
+        local listening="yes"
+      else
+        local listening="no"
+      fi
+      printf '%-16s %-5s %-24s %-9s %s\n' \
+        "${lip}:${lport}" "$proto" "${tip}:${tport}" "$state" "$listening"
+    done
+  else
+    warn "未找到 ${RULES_FILE}，仅列出磁盘上现有的 socat-fwd 单元"
+    printf '%-48s %s\n' "单元" "状态"
+    while IFS= read -r unit; do
+      [[ -n $unit ]] || continue
+      state=$(systemctl is-active "$unit" 2>/dev/null || true)
+      printf '%-48s %s\n' "$unit" "$state"
+    done < <(managed_units_on_disk)
+  fi
+  printf '\n'
+  ss -lntup 2>/dev/null | grep -E "socat-fwd|socat" || true
+}
+
+parse_args() {
+  local arg
+  while [[ $# -gt 0 ]]; do
+    arg=$1
+    case "$arg" in
+      up|apply|install)      ACTION=install ;;
+      status|list|ls)        ACTION=status ;;
+      down|remove|uninstall) ACTION=uninstall ;;
+      clean|reset)           ACTION=clean ;;
+      -t|--target)
+        [[ $# -ge 2 ]] || die "$arg 需要一个参数"
+        TARGET_HOST=$2
+        shift
+        ;;
+      --target=*) TARGET_HOST=${arg#*=} ;;
+      -f|--forward)
+        [[ $# -ge 2 ]] || die "$arg 需要一个参数"
+        FORWARD_SPECS+=("$2")
+        shift
+        ;;
+      --forward=*) FORWARD_SPECS+=("${arg#*=}") ;;
+      -n|--dry-run) DRY_RUN=1 ;;
+      -F|--force)   FORCE=1 ;;
+      -p|--purge)   PURGE=1 ;;
+      -V|--version) printf '%s %s\n' "socat-forward" "$VERSION"; exit 0 ;;
+      -h|--help)    usage; exit 0 ;;
+      tcp:*|udp:*)  FORWARD_SPECS+=("$arg") ;;
+      *) die "未知参数：$arg（-h 查看帮助）" ;;
+    esac
+    shift
+  done
+}
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 1
+  fi
+  parse_args "$@"
+  case $ACTION in
+    install)   do_install ;;
+    uninstall) do_uninstall ;;
+    clean)     do_clean ;;
+    status)    do_status ;;
+    *)         die "未知操作：$ACTION" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
