@@ -3,7 +3,13 @@
 本项目的主要变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [1.2.0] - 2026-10-29
+
+### Changed
+
+- `up` 默认改为增量合并：新规则与已部署规则（状态文件）合并，同一监听端点以新规则为准；
+  之前的行为是整体替换，只写 UDP 规则会把已部署的 TCP 单元删掉
+- 新增 `-r/--replace`：需要整体替换规则集、清理旧单元时使用
 
 ### Added
 

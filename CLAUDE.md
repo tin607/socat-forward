@@ -19,7 +19,8 @@ sudo make install PREFIX=/usr/local
 sudo socat-forward up -t 203.0.113.10 tcp:2222=22 udp:443=443 --dry-run
 sudo socat-forward up -t 203.0.113.10 \
   tcp:2222=22 tcp:443=443 udp:443=443 \
-  tcp:50530=50530 tcp:50960=50960        # deploy/update (declarative, idempotent)
+  tcp:50530=50530 tcp:50960=50960        # deploy/update (merges with deployed rules)
+sudo socat-forward up -r -t 203.0.113.10 tcp:2222=22   # replace the whole rule set (-r)
 sudo socat-forward status                # aliases: list, ls
 sudo socat-forward down [--purge]        # aliases: remove, uninstall
 sudo socat-forward clean [--purge]       # aliases: reset; wipes stale units too
@@ -31,7 +32,7 @@ There is no automated test suite. Validate changes with `make check`, `--dry-run
 ## CLI design
 
 - Primary verbs: `up`, `status`, `down`, `clean`; the earlier names still work as aliases. `up`/`apply`/`install` → `do_install`, `status`/`list`/`ls` → `do_status`, `down`/`remove`/`uninstall` → `do_uninstall`, `clean`/`reset` → `do_clean`.
-- Options accept short and long forms: `-t/--target`, `-f/--forward`, `-n/--dry-run`, `-u/--update`, `-F/--force`, `-p/--purge`, `-V/--version`, `-h/--help`. `--target=IP` and `--forward=SPEC` work too.
+- Options accept short and long forms: `-t/--target`, `-f/--forward`, `-n/--dry-run`, `-u/--update`, `-r/--replace`, `-F/--force`, `-p/--purge`, `-V/--version`, `-h/--help`. `--target=IP` and `--forward=SPEC` work too.
 - A bare argument matching `tcp:*`/`udp:*` is treated as a positional forwarding rule (equivalent to `-f`). This is why the rule grammar is `proto:[listen_ip:]lport=[target_ip:]tport` — an unquoted `->` would be eaten by shell redirection (bash would create a file); quoted `'tcp:2222->22'` is still accepted.
 - Running with no arguments prints usage and exits 1.
 
@@ -41,7 +42,7 @@ There is no automated test suite. Validate changes with `make check`, `--dry-run
 - Unit naming (`unit_name`): wildcard bind → `socat-fwd-<port>-<proto>.service` (backward compatible); specific IP → `socat-fwd-<port>-<proto>-<ip with dots as dashes>.service`.
 - Each unit runs `/usr/bin/socat -d -d` with `TCP4-LISTEN:<port>,bind=<ip>,fork,reuseaddr,backlog=128,keepalive` or `UDP4-LISTEN:<port>,bind=<ip>,fork,reuseaddr` plus `-T $UDP_IDLE_TIMEOUT`. Units use `DynamicUser=yes` and rely on `AmbientCapabilities=CAP_NET_BIND_SERVICE` to bind ports below 1024; preserve that when editing hardening or ExecStart.
 - Deployed rules persist to `RULES_FILE` (`/etc/socat-forward/rules.conf`, pipe-delimited `proto|lip|lport|tip|tport`). `status`/`down` read it; `clean` ignores it and removes every `socat-fwd-*` unit from disk.
-- `up` is declarative: after writing the desired units, `reconcile_stale_units` stops and deletes any `socat-fwd-*` unit not in the new rule set (including units from the old naming scheme), then enables/restarts the desired ones.
+- `up` is incremental by default: `merge_existing_rules` loads `RULES_FILE` and unions it with the rules from the command line, keyed by `(proto, lip, lport)` — a command-line rule wins over a deployed rule with the same listen endpoint, everything else is preserved. `-r/--replace` skips the merge. Because of this, `reconcile_stale_units` normally has nothing to remove; it only deletes stale units in replace mode (or leftovers from the old naming scheme).
 - Preflight in `do_install`: root → systemd → rule validation/duplicates → listen IP exists on a local NIC → loop detection (target equals any local IPv4 or the host's public IPv4) → port occupancy. `-F/--force` bypasses the last three checks.
 - Package handling is deliberately light (`ensure_socat`): if `SOCAT_BIN` exists, apt is not touched at all; if missing, only `apt-get update` + `apt-get install socat` run (no `upgrade`); `apt-get update` + `upgrade` + install happen only with `-u/--update`. Do not reintroduce an unconditional upgrade.
 - Port conflict checking is bind-address aware (`port_listeners` parses `ss -4 -H -lntp/-lnup "sport = :<port>"`, column 4): a listener on another specific IP is not a conflict; a `0.0.0.0` listener conflicts with both wildcard and specific-IP rules; listeners owned by `socat` are tolerated so reruns pass.

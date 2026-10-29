@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2022.04%2B-orange)
 ![Shell](https://img.shields.io/badge/shell-bash-4EAA25)
-![Version](https://img.shields.io/badge/version-1.1.0-informational)
+![Version](https://img.shields.io/badge/version-1.2.0-informational)
 
 ## 特性
 
@@ -14,7 +14,8 @@
 - **systemd 托管**：开机自启、异常自动重启、日志进 journal
 - **安全加固**：服务以 `DynamicUser` 运行，仅保留 `CAP_NET_BIND_SERVICE`，并启用 sandbox 选项
 - **预检保护**：监听 IP 是否存在、端口占用（按监听地址判断）、转发环路、目标可达性
-- **声明式部署**：重跑自动清理旧单元，`--dry-run` 可完整预览；重跑不会升级系统软件包
+- **增量部署**：`up` 默认把本次规则与已部署规则合并，同一监听端点以新规则为准；`-r/--replace` 才整体替换并清理旧单元，`--dry-run` 可完整预览
+- **轻量重跑**：不会升级系统软件包
 - **可运维**：状态文件 + `status` / `down` 命令
 
 ## 快速开始
@@ -45,7 +46,7 @@ sudo socat-forward up -n -t 203.0.113.10 \
 
 | 命令 | 别名 | 说明 |
 | --- | --- | --- |
-| `up` | `apply`、`install` | 部署并启动转发（缺少 socat 时自动安装，不升级系统） |
+| `up` | `apply`、`install` | 部署并启动转发（默认与已部署规则合并；缺少 socat 时自动安装，不升级系统） |
 | `status` | `list`、`ls` | 查看已部署规则、服务状态与监听情况 |
 | `down` | `remove`、`uninstall` | 删除已部署的转发（按状态文件） |
 | `clean` | `reset` | 清除所有 `socat-fwd-*` 单元（含遗留单元） |
@@ -60,6 +61,7 @@ sudo socat-forward up -n -t 203.0.113.10 \
 | `-f, --forward <规则>` | 转发规则，可重复；也可以直接写成位置参数 |
 | `-n, --dry-run` | 只打印将要执行的操作，不做任何修改 |
 | `-u, --update` | 先 `apt-get update` 并升级已安装软件，再部署（默认不做系统升级） |
+| `-r, --replace` | 以本次规则整体替换已部署规则，并清理不在规则集里的旧单元（默认是合并） |
 | `-F, --force` | 跳过监听 IP 不存在 / 端口占用 / 目标为本机的检查 |
 | `-p, --purge` | `down` / `clean` 时同时卸载 socat 软件包 |
 
@@ -104,7 +106,7 @@ sudo socat-forward up -t 203.0.113.10 \
 1. 校验规则：协议、端口、IPv4、重复监听端点
 2. 预检（`-F` 可跳过后三项）：监听 IP 是否在本机、目标是否为本机（环路）、端口是否被占用
 3. 确保 `socat` 可用：已安装则跳过，缺失时才 `apt-get update` 并安装；加 `-u/--update` 才会顺带升级系统软件包（非交互，冲突配置保留本机版本）
-4. 生成并启动 systemd 单元，清理不在本次规则里的旧单元（`up` 是声明式的）
+4. 与状态文件里已部署的规则合并（同一监听端点以新规则为准），生成并启动 systemd 单元；只有 `-r/--replace` 才会清理不在规则集里的旧单元
 5. 规则写入状态文件 `/etc/socat-forward/rules.conf`
 6. 校验服务状态与监听，并直连目标端口给出提示
 
@@ -122,9 +124,15 @@ journalctl -u 'socat-fwd-*' -f
 # 重启单个转发
 sudo systemctl restart socat-fwd-443-tcp
 
-# 修改规则：带上新的规则重跑 up 即可，旧单元会自动清理
-sudo socat-forward up -t 203.0.113.10 tcp:2222=22 udp:443=443
+# 新增 / 修改规则：带上规则重跑 up 即可，默认与已部署规则合并
+sudo socat-forward up -t 203.0.113.10 udp:443=443
+
+# 整体替换规则集（不在命令里的旧规则会被删除）
+sudo socat-forward up -r -t 203.0.113.10 tcp:2222=22 udp:443=443
 ```
+
+> 合并时按「协议 + 监听 IP + 端口」判重：写了一条已有端点的新规则，就更新它的目标，其余规则原样保留。
+> 想删除单条规则，用 `-r/--replace` 重跑完整规则集，或用 `down` 全部删除。
 
 ## 卸载
 

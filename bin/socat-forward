@@ -26,6 +26,7 @@
 #   -f, --forward <规则>  转发规则，可重复；也可直接写成位置参数
 #   -n, --dry-run         只打印将要执行的操作，不做任何修改
 #   -u, --update          先 apt-get update 并升级已安装软件，再部署
+#   -r, --replace         以本次规则整体替换已部署规则（默认与已部署规则合并）
 #   -F, --force           跳过“监听 IP 不存在 / 端口占用 / 目标为本机”的检查
 #   -p, --purge           down/clean 时同时删除 socat 软件包
 #   -V, --version         显示版本
@@ -40,7 +41,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 配置 ------------------------------
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 UNIT_PREFIX="socat-fwd"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
 SOCAT_BIN="${SOCAT_BIN:-/usr/bin/socat}"
@@ -52,6 +53,7 @@ FORCE=0
 DRY_RUN=0
 PURGE=0
 UPDATE_SYSTEM=0
+REPLACE=0
 TARGET_HOST=""
 FORWARD_SPECS=()
 
@@ -104,6 +106,8 @@ usage() {
   -n, --dry-run         只打印将要执行的操作，不做任何修改
   -u, --update          先 apt-get update 并升级已安装软件，再部署
                         （默认不升级系统，仅在本机缺少 socat 时安装）
+  -r, --replace         以本次规则整体替换已部署规则并清理旧单元
+                        （默认是与已部署规则合并，同一监听端点以新规则为准）
   -F, --force           跳过监听 IP 不存在 / 端口占用 / 目标为本机的检查
   -p, --purge           down/clean 时同时卸载 socat
   -V, --version         显示版本
@@ -259,6 +263,67 @@ load_rules_from_file() {
     RULE_TPORT+=("$tport")
   done <"$RULES_FILE"
   (( ${#RULE_PROTO[@]} > 0 ))
+}
+
+# up 默认增量：本次命令行规则与状态文件中已部署的规则合并。
+# 同一监听端点（协议 + 监听 IP + 端口）以本次规则为准，其余旧规则保留；
+# -r/--replace 时才以本次规则整体替换。
+merge_existing_rules() {
+  if (( REPLACE )); then
+    return 0
+  fi
+  [[ -r $RULES_FILE ]] || return 0
+
+  local -a new_proto=("${RULE_PROTO[@]}") new_lip=("${RULE_LIP[@]}")
+  local -a new_lport=("${RULE_LPORT[@]}") new_tip=("${RULE_TIP[@]}")
+  local -a new_tport=("${RULE_TPORT[@]}")
+
+  # 状态文件读不出来时保留本次规则
+  if ! load_rules_from_file; then
+    RULE_PROTO=("${new_proto[@]}")
+    RULE_LIP=("${new_lip[@]}")
+    RULE_LPORT=("${new_lport[@]}")
+    RULE_TIP=("${new_tip[@]}")
+    RULE_TPORT=("${new_tport[@]}")
+    return 0
+  fi
+
+  local -a m_proto=() m_lip=() m_lport=() m_tip=() m_tport=()
+  local -A index_of=()
+  local i j key
+
+  for i in "${!RULE_PROTO[@]}"; do
+    key="${RULE_PROTO[$i]}|${RULE_LIP[$i]}|${RULE_LPORT[$i]}"
+    index_of[$key]=${#m_proto[@]}
+    m_proto+=("${RULE_PROTO[$i]}")
+    m_lip+=("${RULE_LIP[$i]}")
+    m_lport+=("${RULE_LPORT[$i]}")
+    m_tip+=("${RULE_TIP[$i]}")
+    m_tport+=("${RULE_TPORT[$i]}")
+  done
+
+  for i in "${!new_proto[@]}"; do
+    key="${new_proto[$i]}|${new_lip[$i]}|${new_lport[$i]}"
+    if [[ -n ${index_of[$key]:-} ]]; then
+      j=${index_of[$key]}
+      m_tip[j]=${new_tip[$i]}
+      m_tport[j]=${new_tport[$i]}
+    else
+      index_of[$key]=${#m_proto[@]}
+      m_proto+=("${new_proto[$i]}")
+      m_lip+=("${new_lip[$i]}")
+      m_lport+=("${new_lport[$i]}")
+      m_tip+=("${new_tip[$i]}")
+      m_tport+=("${new_tport[$i]}")
+    fi
+  done
+
+  RULE_PROTO=("${m_proto[@]}")
+  RULE_LIP=("${m_lip[@]}")
+  RULE_LPORT=("${m_lport[@]}")
+  RULE_TIP=("${m_tip[@]}")
+  RULE_TPORT=("${m_tport[@]}")
+  log "已合并已部署规则：本次 ${#new_proto[@]} 条，当前共 ${#RULE_PROTO[@]} 条（-r/--replace 可整体替换）"
 }
 
 # ---------------------------- 端口探测 ----------------------------
@@ -652,6 +717,7 @@ do_install() {
   require_systemd
   parse_rules
   check_rule_duplicates
+  merge_existing_rules
   check_listen_ips_exist
   check_target_loop
   check_ports_free
@@ -769,6 +835,7 @@ parse_args() {
       --forward=*) FORWARD_SPECS+=("${arg#*=}") ;;
       -n|--dry-run) DRY_RUN=1 ;;
       -u|--update)  UPDATE_SYSTEM=1 ;;
+      -r|--replace) REPLACE=1 ;;
       -F|--force)   FORCE=1 ;;
       -p|--purge)   PURGE=1 ;;
       -V|--version) printf '%s %s\n' "socat-forward" "$VERSION"; exit 0 ;;
