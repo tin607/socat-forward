@@ -13,8 +13,8 @@ make check                      # bash -n + shellcheck (skips shellcheck if abse
 make install                    # install bin/socat-forward to /usr/local/bin
 sudo make install PREFIX=/usr/local
 
-sudo socat-forward up -t 8.218.254.209 tcp:2222=22 udp:443=443 --dry-run
-sudo socat-forward up -t 8.218.254.209 \
+sudo socat-forward up -t 203.0.113.10 tcp:2222=22 udp:443=443 --dry-run
+sudo socat-forward up -t 203.0.113.10 \
   tcp:2222=22 tcp:443=443 udp:443=443 \
   tcp:50530=50530 tcp:50960=50960        # deploy/update (declarative, idempotent)
 sudo socat-forward status                # aliases: list, ls
