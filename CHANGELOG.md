@@ -3,6 +3,14 @@
 本项目的主要变更记录，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+
+- 版本号管理：`scripts/version.sh` 负责读取 / 校验 / 升级版本号与打标签
+- `make version`、`make bump-version VERSION=x.y.z`、`make tag [PUSH=1]`
+- `make check` 与 CI 校验脚本 `VERSION`、README 徽章、CHANGELOG 最新条目三者一致
+
 ## [1.1.0] - 2026-10-29
 
 ### Changed

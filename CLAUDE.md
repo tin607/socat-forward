@@ -9,7 +9,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-make check                      # bash -n + shellcheck (skips shellcheck if absent)
+make check                      # bash -n + shellcheck + version consistency (skips shellcheck if absent)
+make version                    # print current version
+make bump-version VERSION=x.y.z # bump VERSION + README badge (CHANGELOG entry must exist first)
+make tag PUSH=1                 # create annotated vX.Y.Z tag (and push it)
 make install                    # install bin/socat-forward to /usr/local/bin
 sudo make install PREFIX=/usr/local
 
@@ -52,4 +55,4 @@ There is no automated test suite. Validate changes with `make check`, `--dry-run
 - `DynamicUser` and the capability/hardening directives require a recent systemd (Ubuntu 22.04+); verify generated units with `systemd-analyze verify`.
 - Aliyun public EIPs are NATed and not on a local NIC, so they cannot be used as listen IPs; only `0.0.0.0` or actual interface addresses pass `check_listen_ips_exist`.
 - The loop check uses external IP-echo endpoints and silently skips when unreachable.
-- Keep `README.md` and `CHANGELOG.md` in sync when changing CLI behavior; version lives in `VERSION` at the top of the script and must match the changelog.
+- Keep `README.md` and `CHANGELOG.md` in sync when changing CLI behavior. The version lives in `VERSION` at the top of the script; `scripts/version.sh check` (run by `make check` and CI) enforces that it matches the README badge and the newest numeric CHANGELOG heading. Use `make bump-version VERSION=x.y.z` to bump and `make tag PUSH=1` to tag releases — do not hand-edit the version in only one place.

@@ -153,19 +153,31 @@ sudo socat-forward clean -p
 ## 开发
 
 ```bash
-make check     # bash -n + shellcheck（未安装 shellcheck 时自动跳过）
+make check                      # bash -n + shellcheck + 版本号一致性（未安装 shellcheck 时自动跳过）
+make version                    # 查看当前版本
+make bump-version VERSION=x.y.z # 升级版本号（会同步脚本与 README 徽章）
+make tag PUSH=1                 # 为当前版本创建 vX.Y.Z 注释标签并推送
 ```
 
 仓库结构：
 
 ```
 bin/socat-forward            主脚本（安装后命令名为 socat-forward）
-Makefile                     make check / install / uninstall
-.github/workflows/ci.yml     GitHub Actions：语法检查 + ShellCheck
+scripts/version.sh           版本号读取 / 校验 / 升级 / 打标签
+Makefile                     make check / install / uninstall 与版本管理目标
+.github/workflows/ci.yml     GitHub Actions：语法检查 + ShellCheck + 版本一致性
 README.md
 CHANGELOG.md
 LICENSE
 ```
+
+### 版本管理
+
+版本号的唯一事实来源是 `bin/socat-forward` 顶部的 `VERSION`。`scripts/version.sh` 负责其余工作：
+
+- `make check` 会校验脚本 `VERSION`、README 版本徽章、`CHANGELOG.md` 最新版本条目三者一致，CI 同样执行
+- 发布时先把 `CHANGELOG.md` 的 `[Unreleased]` 改为 `## [x.y.z] - YYYY-MM-DD`，再执行 `make bump-version VERSION=x.y.z`
+- 提交后用 `make tag PUSH=1` 打带注释的 `vX.Y.Z` 标签并推送
 
 ## License
 

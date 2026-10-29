@@ -11,3 +11,4 @@ Thumbs.db
 
 # logs / local artifacts
 *.log
+*.tmp
